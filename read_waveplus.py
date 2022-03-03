@@ -29,7 +29,7 @@
 import struct
 import sys
 import time
-from enum import IntEnum
+from typing import List, Tuple
 
 import tableprint
 from bluepy.btle import DefaultDelegate, Peripheral, Scanner, UUID
@@ -153,13 +153,10 @@ class WavePlus:
             print('ERROR: Devices are not connected.')
             sys.exit(1)
 
-        rawdata = self.curr_val_char.read()
-        rawdata = struct.unpack('<BBBBHHHHHHHH', rawdata)
+        raw_data = self.curr_val_char.read()
+        raw_data = struct.unpack('<BBBBHHHHHHHH', raw_data)
 
-        sensors = Sensors()
-        sensors.set(rawdata)
-
-        return sensors
+        return parse_data(raw_data)
 
     def disconnect(self):
         if self.peripheral is None:
@@ -174,71 +171,93 @@ class WavePlus:
 # Class Sensor and sensor definitions
 # ===================================
 
-class SensorIndex(IntEnum):
-    HUMIDITY = 0
-    RADON_SHORT_TERM_AVG = 1
-    RADON_LONG_TERM_AVG = 2
-    TEMPERATURE = 3
-    REL_ATM_PRESSURE = 4
-    CO2_LVL = 5
-    VOC_LVL = 6
+
+class Sensor:
+    UNIT = None
+
+    def __int__(self, raw_data):
+        self.__value = self._convert(raw_data)
+
+    def _convert(self, raw_data):
+        return raw_data
+
+    @property
+    def value(self):
+        return self.__value
+
+    def __str__(self) -> str:
+        return '{} {}'.format(self.__value, self.__class__.UNIT)
 
 
-SENSOR_UNITS = [
-    '%rH',
-    'Bq/m3',
-    'Bq/m3',
-    '°C',
-    'hPa',
-    'ppm',
-    'ppb',
-]
+class HumiditySensor(Sensor):
+    UNIT = '%rH'
 
-SENSOR_HEADERS = [
-    'Humidity',
-    'Radon ST avg',
-    'Radon LT avg',
-    'Temperature',
-    'Pressure',
-    'CO2 level',
-    'VOC level',
-]
+    def _convert(self, raw_data):
+        return raw_data / 2.0
 
 
-class Sensors:
-    def __init__(self):
-        self.sensor_version = None
-        self.sensor_data = [None] * len(SENSOR_UNITS)
+class RadonSensor(Sensor):
+    UNIT = 'Bq/m3'
 
-    def set(self, rawData):
-        self.sensor_version = rawData[0]
-        if self.sensor_version == 1:
-            self.sensor_data[SensorIndex.HUMIDITY] = rawData[1] / 2.0
-            self.sensor_data[SensorIndex.RADON_SHORT_TERM_AVG] = self.conv2radon(rawData[4])
-            self.sensor_data[SensorIndex.RADON_LONG_TERM_AVG] = self.conv2radon(rawData[5])
-            self.sensor_data[SensorIndex.TEMPERATURE] = rawData[6] / 100.0
-            self.sensor_data[SensorIndex.REL_ATM_PRESSURE] = rawData[7] / 50.0
-            self.sensor_data[SensorIndex.CO2_LVL] = rawData[8]
-            self.sensor_data[SensorIndex.VOC_LVL] = rawData[9]
-        else:
-            print('ERROR: Unknown sensor version.\n')
-            print('GUIDE: Contact Airthings for support.\n')
-            sys.exit(1)
-
-    def conv2radon(self, radon_raw):
-        if 0 <= radon_raw <= 16383:
-            return radon_raw
+    def _convert(self, raw_data):
+        if 0 <= raw_data <= 16383:
+            return raw_data
 
         return 'N/A'  # Either invalid measurement, or not available
 
-    def get_value(self, sensor_index):
-        return self.sensor_data[sensor_index]
 
-    def get_unit(self, sensor_index):
-        return SENSOR_UNITS[sensor_index]
+class TemperatureSensor(Sensor):
+    UNIT = '°C'
 
-    def __iter__(self):
-        return zip(self.sensor_data, SENSOR_UNITS)
+    def _convert(self, raw_data):
+        return raw_data / 100.0
+
+
+class AtmPressureSensor(Sensor):
+    UNIT = 'hPa'
+
+    def _convert(self, raw_data):
+        return raw_data / 50.0
+
+
+class Co2Sensor(Sensor):
+    UNIT = 'ppm'
+
+
+class VocSensor(Sensor):
+    UNIT = 'ppb'
+
+
+SENSORS_V1 = [
+    ('Humidity', HumiditySensor),
+    ('Radon ST avg', RadonSensor),
+    ('Radon LT avg', RadonSensor),
+    ('Temperature', TemperatureSensor),
+    ('Pressure', AtmPressureSensor),
+    ('CO2 level', Co2Sensor),
+    ('VOC level', VocSensor),
+]
+
+
+def parse_data(raw_data: tuple) -> Tuple[List[str], List[Sensor]]:
+    sensor_version = raw_data[0]
+
+    if sensor_version == 1:
+        sensor_spec = SENSORS_V1
+    else:
+        print('ERROR: Unknown sensor version.\n')
+        print('GUIDE: Contact Airthings for support.\n')
+
+        sys.exit(1)
+
+    titles = []
+    sensors = []
+
+    for sensor, raw_value in zip(sensors, raw_data[4:]):
+        titles.append(sensor[0])
+        sensors.append(sensor[1](raw_value))
+
+    return titles, sensors
 
 
 def main():
@@ -250,32 +269,33 @@ def main():
 
     print('Device serial number: {}'.format(SERIAL_NUMBER))
 
-    try:
-        if MODE == 'terminal':
-            print(tableprint.header(SENSOR_HEADERS, width=12))
-        elif MODE == 'pipe':
-            print(SENSOR_HEADERS)
+    line_index = 0
 
+    try:
         while True:
             waveplus.connect()
 
             # read values
-            sensors = waveplus.read()
+            header, sensors = waveplus.read()
+
+            if line_index == 0:
+                if MODE == 'terminal':
+                    print(tableprint.header(header, width=12))
+                elif MODE == 'pipe':
+                    print(header)
 
             # extract
-            data = [
-                '{} {}'.format(data, unit)
-                for data, unit in sensors
-            ]
+            data = [str(sensor) for sensor in sensors]
 
             if MODE == 'terminal':
-                print(
-                    tableprint.row(data, width=12))
+                print(tableprint.row(data, width=12))
             elif MODE == 'pipe':
-                print(
-                    data)
+                print(data)
 
             waveplus.disconnect()
+
+            if line_index > 20:
+                line_index = 0
 
             time.sleep(SAMPLE_PERIOD)
     finally:
